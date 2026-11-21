@@ -2890,6 +2890,7 @@ class CommonKVSender(BaseKVSender):
 class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
+    _duplicate_room_reason: Optional[str] = None
     _lifecycle_lock = nullcontext()
     prompt_fingerprint: Optional[str] = None
 
@@ -2921,12 +2922,13 @@ class CommonKVReceiver(BaseKVReceiver):
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
-        self._owns_bootstrap_room = not (
-            mgr.defer_decode_allocation and bootstrap_room in mgr.request_status
-        )
+        self._owns_bootstrap_room = bootstrap_room not in mgr.request_status
         if not self._owns_bootstrap_room:
-            mgr.record_failure(bootstrap_room, "Duplicate decode bootstrap room")
-            mgr.update_status(bootstrap_room, KVPoll.Failed)
+            # The per-room state belongs to the live request, so fail only this one.
+            self._duplicate_room_reason = (
+                f"bootstrap_room {bootstrap_room} is already in use by "
+                f"a live request on this decode server"
+            )
             self.conclude_state = KVPoll.Failed
             return
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
@@ -3369,6 +3371,9 @@ class CommonKVReceiver(BaseKVReceiver):
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
         self.clear()
+        if self._duplicate_room_reason is not None:
+            # The room's failure record, if any, belongs to the live request.
+            raise KVTransferError(self.bootstrap_room, self._duplicate_room_reason)
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         raise KVTransferError(
